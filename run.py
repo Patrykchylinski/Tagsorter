@@ -1,123 +1,168 @@
 from typing import Generator, Iterable
-from tagger.interrogator import Interrogator
+from tagger.interrogator import WaifuDiffusionInterrogator
 from PIL import Image
 from pathlib import Path
-import argparse
+import sys
+import os
+import shutil
+import psutil
 
-from tagger.interrogators import interrogators
+# Single model configuration
+MODEL = WaifuDiffusionInterrogator(
+    'WD14 ViT v3',
+    repo_id='SmilingWolf/wd-vit-tagger-v3'
+)
 
-parser = argparse.ArgumentParser()
+def get_input_path() -> Path:
+    while True:
+        path = input("Enter path to images: ").strip()
+        if not path:
+            print("Path cannot be empty!")
+            continue
+        
+        path = Path(path)
+        if not path.exists():
+            print("Path does not exist!")
+            continue
+            
+        return path
 
-group = parser.add_mutually_exclusive_group(required=True)
-group.add_argument('--dir', help='Predictions for all images in the directory')
-group.add_argument('--file', help='Predictions for one file')
+def get_operation_mode() -> tuple[str, Path | None]:
+    while True:
+        print("\nChoose operation:")
+        print("1. Delete files")
+        print("2. Copy files")
+        print("3. Move files")
+        
+        choice = input("Enter choice (1-3): ").strip()
+        
+        if choice == "1":
+            return "delete", None
+        elif choice in ["2", "3"]:
+            while True:
+                dest = input("Enter destination path: ").strip()
+                if not dest:
+                    print("Path cannot be empty!")
+                    continue
+                
+                dest_path = Path(dest)
+                if not dest_path.exists():
+                    try:
+                        dest_path.mkdir(parents=True)
+                        print(f"Created directory: {dest_path}")
+                    except Exception as e:
+                        print(f"Error creating directory: {e}")
+                        continue
+                
+                return "copy" if choice == "2" else "move", dest_path
+        else:
+            print("Invalid choice! Please enter 1, 2, or 3")
 
-parser.add_argument(
-    '--threshold',
-    type=float,
-    default=0.35,
-    help='Prediction threshold (default is 0.35)')
-parser.add_argument(
-    '--ext',
-    default='.txt',
-    help='Extension to add to caption file in case of dir option (default is .txt)')
-parser.add_argument(
-    '--overwrite',
-    action='store_true',
-    help='Overwrite caption file if it exists')
-parser.add_argument(
-    '--cpu',
-    action='store_true',
-    help='Use CPU only')
-parser.add_argument(
-    '--rawtag',
-    action='store_true',
-    help='Use the raw output of the model')
-parser.add_argument(
-    '--recursive',
-    action='store_true',
-    help='Enable recursive file search')
-parser.add_argument(
-    '--exclude-tag',
-    dest='exclude_tags',
-    action='append',
-    metavar='t1,t2,t3',
-    help='Specify tags to exclude (Need comma-separated list)')
-parser.add_argument(
-    '--model',
-    default='wd14-convnextv2.v1',
-    choices=list(interrogators.keys()),
-    help='modelname to use for prediction (default is wd14-convnextv2.v1)')
-args = parser.parse_args()
+def get_tags() -> list[str]:
+    while True:
+        tags = input("\nEnter tags (comma separated): ").strip()
+        if not tags:
+            print("Please enter at least one tag!")
+            continue
+        
+        return [tag.strip() for tag in tags.split(",") if tag.strip()]
 
-# get interrogator configs
-interrogator = interrogators[args.model]
+def show_resource_usage():
+    process = psutil.Process()
+    memory_usage = process.memory_info().rss / 1024 / 1024  # MB
+    cpu_percent = process.cpu_percent()
+    print(f"\nResource usage:")
+    print(f"Memory: {memory_usage:.1f} MB")
+    print(f"CPU: {cpu_percent}%")
 
-if args.cpu:
-    interrogator.use_cpu()
-
-def parse_exclude_tags() -> set[str]:
-    if args.exclude_tags is None:
-        return set()
-
-    tags = []
-    for str in args.exclude_tags:
-        for tag in str.split(','):
-            tags.append(tag.strip())
-
-    # reverse escape (nai tag to danbooru tag)
-    reverse_escaped_tags = []
-    for tag in tags:
-        tag = tag.replace(' ', '_').replace('\(', '(').replace('\)', ')')
-        reverse_escaped_tags.append(tag)
-    return set([*tags, *reverse_escaped_tags])  # reduce duplicates
-
-def image_interrogate(image_path: Path, tag_escape: bool, exclude_tags: Iterable[str]) -> dict[str, float]:
-    """
-    Predictions from a image path
-    """
-    im = Image.open(image_path)
-    result = interrogator.interrogate(im)
-
-    return Interrogator.postprocess_tags(
-        result[1],
-        threshold=args.threshold,
-        escape_tag=tag_escape,
-        replace_underscore=tag_escape,
-        exclude_tags=exclude_tags)
-
-def explore_image_files(folder_path: Path) -> Generator[Path, None, None]:
-    """
-    Explore files by folder path
-    """
-    for path in folder_path.iterdir():
-        if path.is_file() and path.suffix in ['.png', '.jpg', '.jpeg', '.webp']:
-            yield path
-        elif args.recursive and path.is_dir():
-            yield from explore_image_files(path)
-
-if args.dir:
-    root_path = Path(args.dir)
-    for image_path in explore_image_files(root_path):
-        caption_path = image_path.parent / f'{image_path.stem}{args.ext}'
-
-        if caption_path.is_file() and not args.overwrite:
-            # skip if caption exists
-            print('skip:', image_path)
+def process_images(source_path: Path, operation: str, dest_path: Path | None, search_tags: list[str]):
+    # Initialize model
+    print("Loading AI model (WD14 ViT v3)...")
+    show_resource_usage()
+    
+    # Use single model
+    interrogator = MODEL
+    
+    print("\nModel loaded!")
+    show_resource_usage()
+    
+    # Get all image files
+    image_files = []
+    for ext in ('*.png', '*.jpg', '*.jpeg', '*.webp'):
+        image_files.extend(source_path.glob(ext))
+    
+    if not image_files:
+        print("No image files found!")
+        return
+    
+    total = len(image_files)
+    print(f"\nFound {total} images")
+    print("Processing...")
+    
+    processed = 0
+    matched = 0
+    
+    for img_path in image_files:
+        try:
+            if processed % 10 == 0:  # pokazuj zużycie co 10 obrazów
+                show_resource_usage()
+                
+            # Open and analyze image
+            img = Image.open(img_path)
+            _, tags = interrogator.interrogate(img)
+            
+            # Filter tags by confidence threshold
+            image_tags = {k.lower(): v for k, v in tags.items() if v >= 0.5}
+            
+            # Check for matching tags
+            has_match = any(search_tag.lower() in image_tags for search_tag in search_tags)
+            
+            processed += 1
+            
+            if has_match:
+                matched += 1
+                if operation == "delete":
+                    os.remove(img_path)
+                elif operation == "copy":
+                    shutil.copy2(img_path, dest_path / img_path.name)
+                else:  # move
+                    shutil.move(img_path, dest_path / img_path.name)
+                print(f"\r{processed}/{total} - Found match! ({matched} matches so far)", end="")
+            else:
+                print(f"\r{processed}/{total} - Processing...", end="")
+            
+        except Exception as e:
+            print(f"\nError processing {img_path}: {e}")
             continue
 
-        print('processing:', image_path)
-        tags = image_interrogate(image_path, not args.rawtag, parse_exclude_tags())
+    print(f"\n\nComplete! Found {matched} matches in {processed} images")
+    if matched > 0:
+        if operation == "delete":
+            print(f"Deleted {matched} files")
+        elif operation == "copy":
+            print(f"Copied {matched} files to {dest_path}")
+        else:
+            print(f"Moved {matched} files to {dest_path}")
 
-        tags_str = ', '.join(tags.keys())
+    print("\nProcessing complete!")
+    show_resource_usage()
 
-        with open(caption_path, 'w') as fp:
-            fp.write(tags_str)
+def main():
+    print("TagSorter\n")
+    
+    # Get source path
+    source_path = get_input_path()
+    
+    # Get operation mode and destination path
+    operation, dest_path = get_operation_mode()
+    
+    # Get tags to search for
+    search_tags = get_tags()
+    
+    # Process images
+    process_images(source_path, operation, dest_path, search_tags)
 
-if args.file:
-    tags = image_interrogate(Path(args.file), not args.rawtag, parse_exclude_tags())
-    print()
-    tags_str = ', '.join(tags.keys())
-    print(tags_str)
+if __name__ == "__main__":
+    main()
 
 
